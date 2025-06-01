@@ -1,13 +1,17 @@
 """
 Copyright start
 MIT License
-Copyright (c) 2024 Fortinet Inc Copyright end
+Copyright (c) 2025 Fortinet Inc
+Copyright end
 """
 
-import base64
+import base64, json, os
 import requests
+import uuid
 from connectors.cyops_utilities.builtins import create_file_from_string
 from connectors.core.connector import get_logger, ConnectorError
+from connectors.cyops_utilities.files import get_ingestion_base_dir
+from datetime import datetime
 
 try:
     from integrations.crudhub import trigger_ingest_playbook
@@ -50,6 +54,7 @@ class TAXIIFeed(object):
 
     def make_request(self, endpoint, headers=None, params=None, data=None, method='GET', api_info=None):
         try:
+            endpoint = self.server_url + endpoint
             headers = {**self.headers, **headers} if headers is not None and headers != '' else self.headers
             response = requests.request(method,
                                         endpoint,
@@ -75,13 +80,18 @@ class TAXIIFeed(object):
             logger.exception('{}'.format(e))
             raise ConnectorError('{}'.format(e))
 
-    def get_api_root_information(self, endpoint, **kwargs):
-        api_root = self.make_request(endpoint=self.server_url + endpoint, headers={'Content-Type': 'application/json'})
+    def get_api_root_information(self, endpoint, health_check=False, **kwargs):
+        if health_check:
+            headers = {'Content-Type': 'application/json', 'Accept': 'application/vnd.oasis.taxii+json;version=2.0'}
+        else:
+            headers = {'Content-Type': 'application/json'}
+        api_root = self.make_request(endpoint=endpoint, headers=headers)
+        logger.debug("First Response: {0}".format(api_root))
         try:
             resp = api_root['api_roots'][0]
             return resp
         except:
-            return self.server_url + 'taxii2'
+            return 'taxii2/'
 
 
 def get_params(params):
@@ -128,14 +138,16 @@ def get_output_schema(config, params, **kwargs):
 def get_collections(config, params, **kwargs):
     taxii = TAXIIFeed(config)
     api_root = taxii.get_api_root_information(endpoint='taxii2/', **kwargs)
-    response_headers = taxii.make_request(endpoint=api_root, api_info='api_root_info')
+    headers = {'Content-Type': 'application/json', 'Accept': 'application/vnd.oasis.taxii+json;version=2.0'}
+    response_headers = taxii.make_request(endpoint=api_root, headers=headers, api_info='api_root_info')
     headers = {'Accept': response_headers['Content-Type']}
     params = {k: v for k, v in params.items() if v is not None and v != ''}
     if params:
-        response = taxii.make_request(endpoint=api_root + '/collections/' + str(params['collectionID']) + '/',
+        response = taxii.make_request(endpoint=api_root + 'collections/' + str(params['collectionID']) + '/',
                                       headers=headers)
     else:
-        response = taxii.make_request(endpoint=api_root + '/collections/', headers=headers)
+        response = taxii.make_request(endpoint=api_root + 'collections/', headers=headers)
+        logger.debug("Response: {0}".format(response))
     if response.get('collections'):
         return response
     else:
@@ -145,25 +157,28 @@ def get_collections(config, params, **kwargs):
 def get_objects_by_collection_id(config, params, **kwargs):
     taxii = TAXIIFeed(config)
     api_root = taxii.get_api_root_information(endpoint='taxii2/', **kwargs)
-    response_headers = taxii.make_request(endpoint=api_root, api_info='api_root_info')
+    headers = {'Content-Type': 'application/json', 'Accept': 'application/vnd.oasis.taxii+json;version=2.0'}
+    response_headers = taxii.make_request(endpoint=api_root, headers=headers, api_info='api_root_info')
     headers = {'Accept': response_headers['Content-Type']}
     params = get_params(params)
     wanted_keys = set(['added_after'])
     mode = params.get('output_mode')
     query_params = {k: params[k] for k in params.keys() & wanted_keys}
     try:
-        response = taxii.make_request(endpoint=api_root + '/collections/' + str(params['collectionID']) + '/objects',
+        response = taxii.make_request(endpoint=api_root + 'collections/' + str(params['collectionID']) + '/objects',
                                       params=query_params, headers=headers)
         if params.get('fetch_all_records'):
             result = response
             next_key = response.get('next')
             while next_key:
-                response = taxii.make_request(endpoint=api_root + '/collections/' + str(params['collectionID']) + '/objects'+'?next={}'.format(next_key),
+                response = taxii.make_request(
+                    endpoint=api_root + 'collections/' + str(params['collectionID']) + '/objects' + '?next={}'.format(
+                        next_key),
                     params=query_params, headers=headers)
                 result['objects'].extend(response.get('objects'))
                 next_key = response.json().get('next')
             response = result.get("objects", [])
-        else:    
+        else:
             response = response.get("objects", [])
         filtered_indicators = [indicator for indicator in response if indicator["type"] == "indicator"]
     except Exception as e:
@@ -183,10 +198,92 @@ def get_objects_by_collection_id(config, params, **kwargs):
         return deduped_indicators
 
 
+def download_indicators(config, params, **kwargs):
+    all_indicators = []
+    collection_ids = []
+    seen = set()
+    # Initialize TAXII client
+    taxii = TAXIIFeed(config)
+    config_id = config.get('config_id')
+
+    # Get API root endpoint and collection IDs
+    api_root = taxii.get_api_root_information(endpoint='taxii2/', **kwargs)
+    collections_response = get_collections(config, params={}, **kwargs)
+
+    if collections_response.get("collections"):
+        collection_ids = [
+            collection.get("id")
+            for collection in collections_response["collections"]
+            if "id" in collection
+        ]
+
+    # Prepare headers for TAXII requests
+    headers = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/vnd.oasis.taxii+json;version=2.0'
+    }
+    response_headers = taxii.make_request(endpoint=api_root, headers=headers, api_info='api_root_info')
+    headers = {'Accept': response_headers['Content-Type']}
+
+    # Extract query parameters
+    params = get_params(params)
+    query_params = {k: params[k] for k in ['added_after'] if k in params}
+    if collection_ids:
+        for collection_id in collection_ids:
+            endpoint = f"{api_root}collections/{collection_id}/objects"
+            response = taxii.make_request(endpoint=endpoint, params=query_params, headers=headers)
+            objects = response.get("objects", [])
+
+            # If fetch_all_records is enabled, paginate through results
+            if params.get('fetch_all_records'):
+                result = response
+                next_key = result.get('next')
+                while next_key:
+                    next_endpoint = f"{endpoint}?next={next_key}"
+                    response = taxii.make_request(endpoint=next_endpoint, params=query_params, headers=headers)
+                    objects.extend(response.get("objects", []))
+                    next_key = response.get('next')
+
+            # Filter and deduplicate indicators
+            filtered_indicators = [indicator for indicator in objects if indicator.get("type") == "indicator"]
+            for indicator in filtered_indicators:
+                pattern = indicator.get("pattern")
+                if pattern and pattern not in seen:
+                    seen.add(pattern)
+                    all_indicators.append(indicator)
+
+        results = {"indicators": all_indicators}
+    else:
+        results = {"indicators": all_indicators}
+
+    # Save results to file
+    base_indicator_dir = get_ingestion_base_dir(**kwargs)
+    try:
+        os.makedirs(base_indicator_dir, exist_ok=True)
+    except Exception as e:
+        logger.warning(f"Failed to create base directory '{base_indicator_dir}', using /tmp/. Error: {e}")
+        base_indicator_dir = '/tmp/'
+
+    config_dir = os.path.join(base_indicator_dir, config_id)
+    os.makedirs(config_dir, exist_ok=True)
+
+    file_name = f"{uuid.uuid4()}.json"
+    file_path = os.path.join(config_dir, file_name)
+
+    try:
+        with open(file_path, "w") as json_file:
+            json.dump(results, json_file, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to write indicators to file: {file_path}. Error: {e}")
+        return {"files": [], "last_pull_datetime": None}
+
+    return {"files": [file_path.replace(base_indicator_dir, '')], "last_pull_datetime": datetime.now()}
+
+
 def _check_health(config, **kwargs):
     try:
         taxii = TAXIIFeed(config)
-        res = taxii.get_api_root_information(endpoint='taxii2/', **kwargs)
+        res = taxii.get_api_root_information(endpoint='taxii2/', health_check=True, **kwargs)
         if res:
             logger.info('connector available')
             return True
@@ -198,5 +295,6 @@ def _check_health(config, **kwargs):
 operations = {
     'get_collections': get_collections,
     'get_objects_by_collection_id': get_objects_by_collection_id,
+    'download_indicators': download_indicators,
     'get_output_schema': get_output_schema
 }
