@@ -10,11 +10,11 @@ import requests
 import uuid
 from connectors.cyops_utilities.builtins import create_file_from_string
 from connectors.core.connector import get_logger, ConnectorError
-from connectors.cyops_utilities.files import get_ingestion_base_dir
 from datetime import datetime
 
 try:
     from integrations.crudhub import trigger_ingest_playbook
+    from connectors.cyops_utilities.files import get_ingestion_base_dir
 except:
     # ignore. lower FSR version
     pass
